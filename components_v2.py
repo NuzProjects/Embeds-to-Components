@@ -7,13 +7,16 @@ to know about Components V2.
 
 Each embed becomes one Container whose children are built in this order:
 
-1. **Thumbnail** (``embed.thumbnail``) — rendered as a ``discord.ui.Thumbnail``
-   and passed as the container's ``accessory`` so it floats right of the text,
-   matching classic embed behaviour.
-2. **Text** (title / description / fields / footer) — one ``TextDisplay``.
-3. **Main image** (``embed.image``) — rendered as a single-item
-   ``discord.ui.MediaGallery`` appended after the text.
-4. **Buttons / selects** from any accompanying ``view=`` — migrated out of the
+1. **Thumbnail** (``embed.thumbnail``) — a ``discord.ui.Section`` whose
+   ``accessory`` is a ``discord.ui.Thumbnail`` (Discord requires thumbnails on
+   sections), with author / title / description / fields / footer as the section
+   body (author and footer icons appear as markdown images in the text).
+2. **Text** — without a thumbnail, one ``TextDisplay`` for the same markdown.
+3. **Fields** — non-inline fields are stacked blocks; up to three consecutive
+   **inline** fields share one row (name line + value line, `` · ``-separated).
+4. **Main image** (``embed.image``) — a single-item ``discord.ui.MediaGallery``
+   appended after the text block.
+5. **Buttons / selects** from any accompanying ``view=`` — migrated out of the
    v1 :class:`discord.ui.View` into ``discord.ui.ActionRow`` items and appended
    inside the same Container so they are visually grouped with the embed content.
 
@@ -39,7 +42,18 @@ from typing import Any, List, Optional, Sequence
 
 import discord
 
-__all__ = ["enable_components_v2_embed_bridge", "is_patched"]
+# Pass as a keyword to patched ``send`` / ``send_message`` / ``edit`` /
+# ``edit_message`` to keep classic embeds + v1 components (no LayoutView).
+# Stripped before the real discord.py coroutine runs.
+SKIP_COMPONENTS_V2_BRIDGE = "_cv2_skip"
+
+__all__ = [
+    "enable_components_v2_embed_bridge",
+    "is_patched",
+    "SKIP_COMPONENTS_V2_BRIDGE",
+    "interaction_send_message_without_cv2_bridge",
+    "message_edit_without_cv2_bridge",
+]
 
 log = logging.getLogger(__name__)
 
@@ -49,10 +63,18 @@ log = logging.getLogger(__name__)
 
 _PATCHED = False
 
+# Pre-monkeypatch callables (set when each method is wrapped). Used to bypass
+# the bridge for flows that must stay classic embed + v1 components — e.g. select
+# menus that edit ``interaction.message`` (a plain :class:`discord.Message` whose
+# ``edit`` is patched).
+_ORIGINAL_INTERACTION_RESPONSE_SEND_MESSAGE: Any = None
+_ORIGINAL_MESSAGE_EDIT: Any = None
+
 # Resolved once at enable-time so every hot-path avoids repeated getattr calls.
 _LayoutView: type | None = None
 _Container: type | None = None
 _TextDisplay: type | None = None
+_Section: type | None = None
 _MediaGallery: type | None = None
 _MediaGalleryItem: type | None = None
 _Thumbnail: type | None = None
@@ -128,29 +150,115 @@ def _embed_image_url(embed: discord.Embed, attr: str) -> Optional[str]:
     return url
 
 
+def _embed_fields_to_markdown(fields: Sequence[Any]) -> str:
+    """
+    Embed fields as markdown: full-width blocks for ``inline=False``, and up to
+    three ``inline=True`` fields per row (names on one line, values on the next).
+    """
+    if not fields:
+        return ""
+
+    parts: List[str] = []
+    i = 0
+    n = len(fields)
+    while i < n:
+        field = fields[i]
+        if not getattr(field, "inline", True):
+            name = (getattr(field, "name", None) or "").strip()
+            value = (getattr(field, "value", None) or "")
+            block: List[str] = []
+            if name:
+                block.append(f"**{name}**")
+            if value:
+                block.append(value)
+            if block:
+                parts.append("\n".join(block))
+            i += 1
+            continue
+
+        row: List[Any] = []
+        while i < n and getattr(fields[i], "inline", True) and len(row) < 3:
+            row.append(fields[i])
+            i += 1
+        if not row:
+            i += 1
+            continue
+
+        row_names: List[str] = []
+        row_vals: List[str] = []
+        for f in row:
+            fn = (getattr(f, "name", None) or "").strip()
+            fv = (getattr(f, "value", None) or "")
+            fv_one = " ".join(fv.splitlines()).strip()
+            row_names.append(f"**{fn}**" if fn else "\u200b")
+            row_vals.append(fv_one if fv_one else "\u200b")
+
+        if len(row) == 1:
+            parts.append(f"{row_names[0]}\n{row_vals[0]}")
+        else:
+            parts.append(" · ".join(row_names))
+            parts.append(" · ".join(row_vals))
+
+    return "\n\n".join(parts)
+
+
+def _embed_author_markdown(embed: discord.Embed) -> str:
+    """Author line: optional icon image + linked or bold name (``embed.author``)."""
+    auth = getattr(embed, "author", None)
+    if auth is None or _is_missing(auth):
+        return ""
+    name = (getattr(auth, "name", None) or "").strip()
+    url = getattr(auth, "url", None)
+    icon_url = getattr(auth, "icon_url", None)
+    if not name and (icon_url is None or _is_missing(icon_url)):
+        return ""
+
+    bits: List[str] = []
+    if icon_url and not _is_missing(icon_url):
+        bits.append(f"![]({icon_url})")
+    if name:
+        if url and not _is_missing(url):
+            bits.append(f"[**{name}**]({url})")
+        else:
+            bits.append(f"**{name}**")
+    return " ".join(bits) if bits else ""
+
+
+def _embed_footer_markdown(embed: discord.Embed) -> str:
+    """Footer: optional icon + subtext (``embed.footer``)."""
+    foot = getattr(embed, "footer", None)
+    if foot is None or _is_missing(foot):
+        return ""
+    text = getattr(foot, "text", None)
+    if not text or _is_missing(text):
+        return ""
+    icon_url = getattr(foot, "icon_url", None)
+    if icon_url and not _is_missing(icon_url):
+        return f"![]({icon_url}) -# {text}"
+    return f"-# {text}"
+
+
 def _embed_to_markdown(embed: discord.Embed) -> str:
     """Render an :class:`discord.Embed` as discord-flavoured Markdown."""
     parts: List[str] = []
+
+    author_md = _embed_author_markdown(embed)
+    if author_md:
+        parts.append(author_md)
 
     if embed.title:
         parts.append(f"## {embed.title}")
 
     if embed.description:
-        # Avoid double spacing before footer: join() adds \n\n between parts;
-        # a trailing \n\n on description would leave an empty quoted-looking gap.
         parts.append(embed.description.strip())
 
-    for field in embed.fields:
-        name = getattr(field, "name", None) or ""
-        value = getattr(field, "value", None) or ""
-        if name:
-            parts.append(f"**{name}**")
-        if value:
-            parts.append(value)
+    field_md = _embed_fields_to_markdown(embed.fields)
+    if field_md:
+        parts.append(field_md)
 
-    footer_text = getattr(getattr(embed, "footer", None), "text", None)
-    if footer_text:
-        parts.append(f"-# {footer_text}")
+    footer_md = _embed_footer_markdown(embed)
+    if footer_md:
+        parts.append(footer_md)
 
     return "\n\n".join(p for p in parts if p).strip() or "\u200b"
 
@@ -274,6 +382,27 @@ def _build_thumbnail(url: str) -> Any | None:
     return None
 
 
+def _build_section_with_thumbnail(body_markdown: str, thumbnail_url: str) -> Any | None:
+    """
+    Build a :class:`discord.ui.Section` with body text and a ``Thumbnail`` accessory.
+    Thumbnails are only valid as a Section accessory in the v2 component kit.
+    """
+    if _Section is None or _Thumbnail is None:
+        return None
+    thumb = _build_thumbnail(thumbnail_url)
+    if thumb is None:
+        return None
+    text = body_markdown.strip() or "\u200b"
+    try:
+        return _Section(text, accessory=thumb)
+    except Exception:
+        log.debug(
+            "components_v2_bridge: Section+Thumbnail failed — falling back to plain text",
+            exc_info=True,
+        )
+        return None
+
+
 def _build_container(
     children: Sequence[Any],
     *,
@@ -282,9 +411,6 @@ def _build_container(
     """
     Instantiate a :class:`discord.ui.Container` with *children* and accent colour.
 
-    Accessory (thumbnail) is intentionally NOT passed here — it is applied
-    separately via ``_apply_accessory`` so a failed thumbnail never prevents
-    the container from being built at all.
     """
     if _Container is None:
         return None
@@ -305,26 +431,6 @@ def _build_container(
 
     log.warning("components_v2_bridge: Container — all signatures failed")
     return None
-
-
-def _apply_accessory(container: Any, accessory: Any) -> None:
-    """
-    Attach *accessory* (a Thumbnail) to an already-built *container*.
-
-    Tries known post-construction setter patterns.  Failure is fully silent —
-    losing a thumbnail is cosmetic, not functional, and must never raise.
-    """
-    try:
-        container.accessory = accessory
-        return
-    except (AttributeError, TypeError):
-        pass
-    try:
-        container.add_item(accessory)
-        return
-    except (AttributeError, TypeError):
-        pass
-    log.debug("components_v2_bridge: could not attach thumbnail accessory — skipping")
 
 
 def _build_layout_view(items: List[Any]) -> Any | None:
@@ -405,13 +511,12 @@ def _build_embed_container(
     Build order (failures in any optional step are isolated and logged, never
     propagated — the container is always attempted even if images fail):
 
-        1. TextDisplay  — title / description / fields / footer
-        2. MediaGallery — embed.image (appended after text if built successfully)
-        3. ActionRow…   — migrated buttons / selects
-        4. Container    — wraps 1-3; built without accessory so it cannot fail
-                          due to thumbnail
-        5. Thumbnail    — embed.thumbnail applied post-construction via
-                          _apply_accessory; failure is silent / cosmetic
+        1. **Section** + ``Thumbnail`` accessory when ``embed.thumbnail`` is set
+           (author, title, description, fields, footer as one text block); else a
+           single **TextDisplay** for that markdown.  ``embed.author`` and
+           ``embed.footer`` (including icons) are rendered in markdown.
+        2. **MediaGallery** — ``embed.image`` (appended after the text block).
+        3. **ActionRow** — migrated buttons / selects from a classic v1 view.
     """
     md = _embed_to_markdown(embed)
     if prepend_content:
@@ -419,9 +524,16 @@ def _build_embed_container(
 
     children: List[Any] = []
 
-    text = _build_text_display(md)
-    if text is not None:
-        children.append(text)
+    thumbnail_url = _embed_image_url(embed, "thumbnail")
+    primary: Any | None = None
+    if thumbnail_url:
+        primary = _build_section_with_thumbnail(md, thumbnail_url)
+    if primary is None:
+        text = _build_text_display(md)
+        if text is not None:
+            primary = text
+    if primary is not None:
+        children.append(primary)
 
     # embed.image → MediaGallery (isolated: failure drops the image, not the container)
     image_url = _embed_image_url(embed, "image")
@@ -438,24 +550,7 @@ def _build_embed_container(
 
     children.extend(action_rows)
 
-    container = _build_container(children, colour=_embed_colour(embed))
-    if container is None:
-        return None
-
-    # embed.thumbnail → Thumbnail accessory (isolated: cosmetic, never fatal)
-    thumbnail_url = _embed_image_url(embed, "thumbnail")
-    if thumbnail_url:
-        try:
-            thumb = _build_thumbnail(thumbnail_url)
-            if thumb is not None:
-                _apply_accessory(container, thumb)
-        except Exception:
-            log.debug(
-                "components_v2_bridge: Thumbnail construction raised for %s — skipping",
-                thumbnail_url, exc_info=True,
-            )
-
-    return container
+    return _build_container(children, colour=_embed_colour(embed))
 
 
 def _transform_kwargs(kwargs: dict) -> bool:
@@ -543,6 +638,8 @@ def _transform_kwargs(kwargs: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def _patch_async_method(target: Any, method_name: str) -> None:
+    global _ORIGINAL_INTERACTION_RESPONSE_SEND_MESSAGE, _ORIGINAL_MESSAGE_EDIT
+
     original = getattr(target, method_name, None)
     if original is None:
         log.debug("components_v2_bridge: %s.%s not found, skipping", target, method_name)
@@ -552,13 +649,38 @@ def _patch_async_method(target: Any, method_name: str) -> None:
         log.debug("components_v2_bridge: %s.%s already patched, skipping", target, method_name)
         return
 
+    if target is discord.InteractionResponse and method_name == "send_message":
+        _ORIGINAL_INTERACTION_RESPONSE_SEND_MESSAGE = original
+    elif target is discord.Message and method_name == "edit":
+        _ORIGINAL_MESSAGE_EDIT = original
+
     async def wrapped(*args, **kwargs):
+        if kwargs.pop(SKIP_COMPONENTS_V2_BRIDGE, False):
+            return await original(*args, **kwargs)
+
         pristine = dict(kwargs)
         transformed = _transform_kwargs(kwargs)
+        # Interaction UPDATE with LayoutView must clear legacy fields; if embed /
+        # content are left as MISSING, Discord may keep old embeds alongside new
+        # components (broken layout or an apparent "second" message block).
+        if transformed and method_name == "edit_message" and target is discord.InteractionResponse:
+            kwargs["embed"] = None
+            if "content" not in kwargs:
+                kwargs["content"] = None
         try:
             return await original(*args, **kwargs)
         except discord.HTTPException as exc:
             if transformed:
+                # A message that was sent via this bridge has ``components_v2`` set.
+                # Discord forbids classic ``embed`` / ``embeds`` on that message;
+                # retrying with *pristine* kwargs is invalid and can glitch the client.
+                if method_name == "edit_message" and target is discord.InteractionResponse:
+                    log.warning(
+                        "components_v2_bridge: InteractionResponse.edit_message failed "
+                        "(%s); not retrying with classic embeds on a V2-flagged message",
+                        exc.status,
+                    )
+                    raise
                 log.debug(
                     "components_v2_bridge: HTTPException on V2 payload (%s), retrying with embeds",
                     exc.status,
@@ -569,6 +691,33 @@ def _patch_async_method(target: Any, method_name: str) -> None:
     wrapped._cv2_patched = True  # type: ignore[attr-defined]
     setattr(target, method_name, wrapped)
     log.debug("components_v2_bridge: patched %s.%s", target.__name__, method_name)
+
+
+async def interaction_send_message_without_cv2_bridge(
+    response: discord.InteractionResponse,
+    **kwargs: Any,
+) -> Any:
+    """
+    Run :meth:`discord.InteractionResponse.send_message` without the embed→LayoutView
+    bridge. Prefer this over ``SKIP_COMPONENTS_V2_BRIDGE`` when you need a guarantee
+    the hook never runs (e.g. another layer strips unknown kwargs).
+    """
+    fn = _ORIGINAL_INTERACTION_RESPONSE_SEND_MESSAGE
+    if fn is None:
+        return await response.send_message(**kwargs)
+    return await fn(response, **kwargs)
+
+
+async def message_edit_without_cv2_bridge(message: discord.Message, **kwargs: Any) -> Any:
+    """
+    Run :meth:`discord.Message.edit` without the embed→LayoutView bridge.
+    Component interactions expose a plain :class:`discord.Message` whose ``edit``
+    is patched; use this after ``defer()`` to replace the message in-channel.
+    """
+    fn = _ORIGINAL_MESSAGE_EDIT
+    if fn is None:
+        return await message.edit(**kwargs)
+    return await fn(message, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +731,7 @@ def enable_components_v2_embed_bridge() -> None:
     Idempotent — safe to call multiple times; only the first call has any effect.
     Call this once at bot startup **before** loading cogs.
     """
-    global _PATCHED, _LayoutView, _Container, _TextDisplay
+    global _PATCHED, _LayoutView, _Container, _TextDisplay, _Section
     global _MediaGallery, _MediaGalleryItem, _Thumbnail, _UnfurledMediaItem
     global _ActionRow, _MISSING
 
@@ -592,6 +741,7 @@ def enable_components_v2_embed_bridge() -> None:
     _LayoutView        = getattr(discord.ui, "LayoutView",        None)
     _Container         = getattr(discord.ui, "Container",         None)
     _TextDisplay       = getattr(discord.ui, "TextDisplay",       None)
+    _Section           = getattr(discord.ui, "Section",           None)
     _MediaGallery      = getattr(discord.ui, "MediaGallery",      None)
     # MediaGalleryItem / UnfurledMediaItem live in discord.components and are
     # re-exported on discord; discord.ui does not expose MediaGalleryItem.
@@ -617,6 +767,7 @@ def enable_components_v2_embed_bridge() -> None:
     # Optional classes — degrade gracefully when absent.
     optional_missing = [
         name for name, cls in (
+            ("Section",           _Section),
             ("MediaGallery",      _MediaGallery),
             ("MediaGalleryItem",  _MediaGalleryItem),
             ("Thumbnail",        _Thumbnail),
