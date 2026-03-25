@@ -9,8 +9,9 @@ Each embed becomes one Container whose children are built in this order:
 
 1. **Thumbnail** (``embed.thumbnail``) — a ``discord.ui.Section`` whose
    ``accessory`` is a ``discord.ui.Thumbnail`` (Discord requires thumbnails on
-   sections), with author / title / description / fields / footer as the section
-   body (author and footer icons appear as markdown images in the text).
+   sections), with title / description / fields / footer as the section body.
+   ``embed.footer`` text is shown; footer ``icon_url`` is intentionally omitted
+   (V2 ``TextDisplay`` does not mirror classic footer icons cleanly).
 2. **Text** — without a thumbnail, one ``TextDisplay`` for the same markdown.
 3. **Fields** — non-inline fields are stacked blocks; up to three consecutive
    **inline** fields share one row (name line + value line, `` · ``-separated).
@@ -202,49 +203,20 @@ def _embed_fields_to_markdown(fields: Sequence[Any]) -> str:
     return "\n\n".join(parts)
 
 
-def _embed_author_markdown(embed: discord.Embed) -> str:
-    """Author line: optional icon image + linked or bold name (``embed.author``)."""
-    auth = getattr(embed, "author", None)
-    if auth is None or _is_missing(auth):
-        return ""
-    name = (getattr(auth, "name", None) or "").strip()
-    url = getattr(auth, "url", None)
-    icon_url = getattr(auth, "icon_url", None)
-    if not name and (icon_url is None or _is_missing(icon_url)):
-        return ""
-
-    bits: List[str] = []
-    if icon_url and not _is_missing(icon_url):
-        bits.append(f"![]({icon_url})")
-    if name:
-        if url and not _is_missing(url):
-            bits.append(f"[**{name}**]({url})")
-        else:
-            bits.append(f"**{name}**")
-    return " ".join(bits) if bits else ""
-
-
 def _embed_footer_markdown(embed: discord.Embed) -> str:
-    """Footer: optional icon + subtext (``embed.footer``)."""
+    """Footer subtext only (``embed.footer``); ``icon_url`` is never rendered as an image."""
     foot = getattr(embed, "footer", None)
     if foot is None or _is_missing(foot):
         return ""
     text = getattr(foot, "text", None)
     if not text or _is_missing(text):
         return ""
-    icon_url = getattr(foot, "icon_url", None)
-    if icon_url and not _is_missing(icon_url):
-        return f"![]({icon_url}) -# {text}"
     return f"-# {text}"
 
 
 def _embed_to_markdown(embed: discord.Embed) -> str:
     """Render an :class:`discord.Embed` as discord-flavoured Markdown."""
     parts: List[str] = []
-
-    author_md = _embed_author_markdown(embed)
-    if author_md:
-        parts.append(author_md)
 
     if embed.title:
         parts.append(f"## {embed.title}")
@@ -512,9 +484,9 @@ def _build_embed_container(
     propagated — the container is always attempted even if images fail):
 
         1. **Section** + ``Thumbnail`` accessory when ``embed.thumbnail`` is set
-           (author, title, description, fields, footer as one text block); else a
-           single **TextDisplay** for that markdown.  ``embed.author`` and
-           ``embed.footer`` (including icons) are rendered in markdown.
+           (title / description / fields / footer as one text block); else a
+           single **TextDisplay** for that markdown.  ``embed.footer`` text is
+           rendered; footer ``icon_url`` is ignored for display.
         2. **MediaGallery** — ``embed.image`` (appended after the text block).
         3. **ActionRow** — migrated buttons / selects from a classic v1 view.
     """
