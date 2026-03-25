@@ -216,23 +216,26 @@ def _embed_footer_markdown(embed: discord.Embed) -> str:
 
 def _embed_to_markdown(embed: discord.Embed) -> str:
     """Render an :class:`discord.Embed` as discord-flavoured Markdown."""
-    parts: List[str] = []
+    body_parts: List[str] = []
 
     if embed.title:
-        parts.append(f"## {embed.title}")
+        body_parts.append(f"## {embed.title}")
 
     if embed.description:
-        parts.append(embed.description.strip())
+        body_parts.append(embed.description.strip())
 
     field_md = _embed_fields_to_markdown(embed.fields)
     if field_md:
-        parts.append(field_md)
+        body_parts.append(field_md)
 
+    body = "\n\n".join(p for p in body_parts if p).strip()
     footer_md = _embed_footer_markdown(embed)
+    if footer_md and body:
+        # Keep footer visually attached to content; avoid an extra paragraph gap.
+        return f"{body}\n{footer_md}".strip() or "\u200b"
     if footer_md:
-        parts.append(footer_md)
-
-    return "\n\n".join(p for p in parts if p).strip() or "\u200b"
+        return footer_md.strip() or "\u200b"
+    return body or "\u200b"
 
 
 # ---------------------------------------------------------------------------
@@ -448,22 +451,54 @@ def _extract_action_rows(v1_view: Any) -> List[Any]:
     action_rows: List[Any] = []
     for row_idx in sorted(rows):
         items_in_row = rows[row_idx]
-        for args, kw in (
-            (tuple(items_in_row), {}),
-            ((), {"components": items_in_row}),
-            ((), {"children": items_in_row}),
-        ):
-            try:
-                action_rows.append(_ActionRow(*args, **kw))
-                break
-            except TypeError:
-                continue
-        else:
-            log.warning(
-                "components_v2_bridge: ActionRow row %d — all signatures failed, "
-                "those components will be dropped",
-                row_idx,
-            )
+        # Build rows via add_item() so migrated children get proper parent/view
+        # wiring for Container/LayoutView. This is especially important for selects.
+        current_row: Any | None = None
+        for item in items_in_row:
+            if current_row is None:
+                try:
+                    current_row = _ActionRow()
+                except Exception:
+                    current_row = None
+
+            if current_row is not None:
+                try:
+                    current_row.add_item(item)
+                    continue
+                except (TypeError, ValueError):
+                    # Row full / incompatible: commit current row and start new one.
+                    if getattr(current_row, "children", None):
+                        action_rows.append(current_row)
+                    try:
+                        current_row = _ActionRow()
+                        current_row.add_item(item)
+                        continue
+                    except Exception:
+                        current_row = None
+
+            # Constructor fallback for unknown forks/signatures.
+            built = None
+            for args, kw in (
+                ((item,), {}),
+                ((), {"components": [item]}),
+                ((), {"children": [item]}),
+            ):
+                try:
+                    built = _ActionRow(*args, **kw)
+                    break
+                except TypeError:
+                    continue
+            if built is not None:
+                action_rows.append(built)
+            else:
+                log.warning(
+                    "components_v2_bridge: ActionRow row %d item %s could not be migrated",
+                    row_idx,
+                    item.__class__.__name__,
+                )
+
+        if current_row is not None and getattr(current_row, "children", None):
+            action_rows.append(current_row)
 
     return action_rows
 
